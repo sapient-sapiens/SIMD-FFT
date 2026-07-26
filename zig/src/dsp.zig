@@ -15,6 +15,17 @@ fn cmul(ar: f32, ai: f32, br: f32, bi: f32) struct { re: f32, im: f32 } {
     return .{ .re = ar * br - ai * bi, .im = ar * bi + ai * br };
 }
 
+/// W[k] = exp(-2π i k / N) for k = 0 .. N-1. Call once; reuse across transforms.
+fn fillTwiddles(wr: []f32, wi: []f32) void {
+    const n = wr.len;
+    const n_f: f32 = @floatFromInt(n);
+    for (wr, wi, 0..) |*r, *i, k| {
+        const angle = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / n_f;
+        r.* = @cos(angle);
+        i.* = @sin(angle);
+    }
+}
+
 fn digitReverse4Index(i: usize, digits: usize) usize {
     var x = i;
     var y: usize = 0;
@@ -63,9 +74,9 @@ fn dft(re: []f32, im: []f32, scratch_re: []f32, scratch_im: []f32) void {
     }
 }
 
-/// In-place scalar radix-4 FFT. Requires N = 4^p.
-/// Chosen over recursive r2/r4 and iterative r2 after local benches (see commit).
-fn fft(re: []f32, im: []f32) void {
+/// In-place scalar radix-4 FFT. N = 4^p; `wr`/`wi` from fillTwiddles (length N).
+/// Stage twiddle W_len^k = W_N^{k · N/len}.
+fn fft(re: []f32, im: []f32, wr: []const f32, wi: []const f32) void {
     const n = re.len;
     if (n <= 1) return;
 
@@ -74,12 +85,11 @@ fn fft(re: []f32, im: []f32) void {
     var len: usize = 4;
     while (len <= n) : (len *= 4) {
         const q = len / 4;
-        const len_f: f32 = @floatFromInt(len);
+        const stride = n / len; // W_len^k lives at table index k*stride
         var start: usize = 0;
         while (start < n) : (start += len) {
             var k: usize = 0;
             while (k < q) : (k += 1) {
-                const kf: f32 = @floatFromInt(k);
                 const idx0 = start + k;
                 const idx1 = idx0 + q;
                 const idx2 = idx0 + 2 * q;
@@ -87,9 +97,9 @@ fn fft(re: []f32, im: []f32) void {
 
                 const t0r = re[idx0];
                 const t0i = im[idx0];
-                const w1 = cmul(re[idx1], im[idx1], @cos(-2.0 * std.math.pi * kf / len_f), @sin(-2.0 * std.math.pi * kf / len_f));
-                const w2 = cmul(re[idx2], im[idx2], @cos(-4.0 * std.math.pi * kf / len_f), @sin(-4.0 * std.math.pi * kf / len_f));
-                const w3 = cmul(re[idx3], im[idx3], @cos(-6.0 * std.math.pi * kf / len_f), @sin(-6.0 * std.math.pi * kf / len_f));
+                const w1 = cmul(re[idx1], im[idx1], wr[k * stride], wi[k * stride]);
+                const w2 = cmul(re[idx2], im[idx2], wr[2 * k * stride], wi[2 * k * stride]);
+                const w3 = cmul(re[idx3], im[idx3], wr[3 * k * stride], wi[3 * k * stride]);
 
                 re[idx0] = t0r + w1.re + w2.re + w3.re;
                 im[idx0] = t0i + w1.im + w2.im + w3.im;
@@ -112,7 +122,6 @@ test "hannWindow endpoints" {
 }
 
 test "fft matches dft" {
-    // Powers of 4 only (radix-4).
     const sizes = [_]usize{ 4, 16, 64 };
     for (sizes) |n| {
         const allocator = std.testing.allocator;
@@ -128,6 +137,12 @@ test "fft matches dft" {
         defer allocator.free(scratch_re);
         const scratch_im = try allocator.alloc(f32, n);
         defer allocator.free(scratch_im);
+        const wr = try allocator.alloc(f32, n);
+        defer allocator.free(wr);
+        const wi = try allocator.alloc(f32, n);
+        defer allocator.free(wi);
+
+        fillTwiddles(wr, wi);
 
         for (re, d_re, im, d_im, 0..) |*r, *dr, *i, *di, idx| {
             const x = @sin(0.7 * @as(f32, @floatFromInt(idx)) + 0.3);
@@ -137,7 +152,7 @@ test "fft matches dft" {
             di.* = 0;
         }
 
-        fft(re, im);
+        fft(re, im, wr, wi);
         dft(d_re, d_im, scratch_re, scratch_im);
 
         var max_abs: f32 = 0;
