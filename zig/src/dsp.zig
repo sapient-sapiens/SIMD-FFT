@@ -33,34 +33,6 @@ fn fillTwiddles(wr: []f32, wi: []f32) void {
     }
 }
 
-fn digitReverse4Index(i: usize, digits: usize) usize {
-    var x = i;
-    var y: usize = 0;
-    var d: usize = 0;
-    while (d < digits) : (d += 1) {
-        y = (y << 2) | (x & 3);
-        x >>= 2;
-    }
-    return y;
-}
-
-fn digitReverse4(re: []f32, im: []f32) void {
-    const n = re.len;
-    const digits = @ctz(n) / 2;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const j = digitReverse4Index(i, digits);
-        if (j > i) {
-            const tr = re[i];
-            re[i] = re[j];
-            re[j] = tr;
-            const ti = im[i];
-            im[i] = im[j];
-            im[j] = ti;
-        }
-    }
-}
-
 fn dft(re: []f32, im: []f32, scratch_re: []f32, scratch_im: []f32) void {
     const n = re.len;
     @memcpy(scratch_re[0..n], re[0..n]);
@@ -80,106 +52,126 @@ fn dft(re: []f32, im: []f32, scratch_re: []f32, scratch_im: []f32) void {
     }
 }
 
-/// In-place radix-4 FFT. N = 4^p; `wr`/`wi` from fillTwiddles.
-fn fft(re: []f32, im: []f32, wr: []const f32, wi: []const f32, backend: Backend) void {
+/// Stockham autosort radix-4 DIT. No digit-reverse; ping-pong via `scratch_*`.
+fn fft(
+    re: []f32,
+    im: []f32,
+    scratch_re: []f32,
+    scratch_im: []f32,
+    wr: []const f32,
+    wi: []const f32,
+    backend: Backend,
+) void {
     const n = re.len;
     if (n <= 1) return;
 
-    digitReverse4(re, im);
+    var stages: usize = 0;
+    var t = n;
+    while (t > 1) : (t /= 4) stages += 1;
 
-    var len: usize = 4;
-    while (len <= n) : (len *= 4) {
-        const q = len / 4;
-        const stride = n / len;
-        var start: usize = 0;
-        while (start < n) : (start += len) {
-            var k: usize = 0;
-            if (backend == .simd) {
-                while (k + lanes <= q) : (k += lanes) {
-                    const base = start + k;
-                    const ar: Vec = re[base..][0..lanes].*;
-                    const ai: Vec = im[base..][0..lanes].*;
-                    const br: Vec = re[base + q ..][0..lanes].*;
-                    const bi: Vec = im[base + q ..][0..lanes].*;
-                    const cr: Vec = re[base + 2 * q ..][0..lanes].*;
-                    const ci: Vec = im[base + 2 * q ..][0..lanes].*;
-                    const dr: Vec = re[base + 3 * q ..][0..lanes].*;
-                    const di: Vec = im[base + 3 * q ..][0..lanes].*;
+    var in_re = re;
+    var in_im = im;
+    var out_re = scratch_re;
+    var out_im = scratch_im;
 
-                    var w1r: Vec = undefined;
-                    var w1i: Vec = undefined;
-                    var w2r: Vec = undefined;
-                    var w2i: Vec = undefined;
-                    var w3r: Vec = undefined;
-                    var w3i: Vec = undefined;
-                    inline for (0..lanes) |lane| {
-                        const kk = k + lane;
-                        w1r[lane] = wr[kk * stride];
-                        w1i[lane] = wi[kk * stride];
-                        w2r[lane] = wr[2 * kk * stride];
-                        w2i[lane] = wi[2 * kk * stride];
-                        w3r[lane] = wr[3 * kk * stride];
-                        w3i[lane] = wi[3 * kk * stride];
-                    }
+    var stage = stages;
+    while (stage >= 1) : (stage -= 1) {
+        var nq = n;
+        var s: usize = 0;
+        while (s < stage) : (s += 1) nq /= 4;
 
-                    const t1 = cmulV(br, bi, w1r, w1i);
-                    const t2 = cmulV(cr, ci, w2r, w2i);
-                    const t3 = cmulV(dr, di, w3r, w3i);
+        var stride: usize = 1;
+        var u: usize = 1;
+        while (u < stage) : (u += 1) stride *= 4;
 
-                    re[base..][0..lanes].* = ar + t1.re + t2.re + t3.re;
-                    im[base..][0..lanes].* = ai + t1.im + t2.im + t3.im;
-                    re[base + q ..][0..lanes].* = ar + t1.im - t2.re - t3.im;
-                    im[base + q ..][0..lanes].* = ai - t1.re - t2.im + t3.re;
-                    re[base + 2 * q ..][0..lanes].* = ar - t1.re + t2.re - t3.re;
-                    im[base + 2 * q ..][0..lanes].* = ai - t1.im + t2.im - t3.im;
-                    re[base + 3 * q ..][0..lanes].* = ar - t1.im - t2.re + t3.im;
-                    im[base + 3 * q ..][0..lanes].* = ai + t1.re - t2.im - t3.re;
-                }
-                while (k < q) : (k += 1) {
-                    const idx0 = start + k;
-                    const idx1 = idx0 + q;
-                    const idx2 = idx0 + 2 * q;
-                    const idx3 = idx0 + 3 * q;
+        var p: usize = 0;
+        while (p < nq) : (p += 1) {
+            const w1r = wr[p * stride];
+            const w1i = wi[p * stride];
+            const w2r = wr[2 * p * stride];
+            const w2i = wi[2 * p * stride];
+            const w3r = wr[3 * p * stride];
+            const w3i = wi[3 * p * stride];
 
-                    const t0r = re[idx0];
-                    const t0i = im[idx0];
-                    const w1 = cmul(re[idx1], im[idx1], wr[k * stride], wi[k * stride]);
-                    const w2 = cmul(re[idx2], im[idx2], wr[2 * k * stride], wi[2 * k * stride]);
-                    const w3 = cmul(re[idx3], im[idx3], wr[3 * k * stride], wi[3 * k * stride]);
+            var q: usize = 0;
+            if (backend == .simd and stride >= lanes) {
+                const w1rv: Vec = @splat(w1r);
+                const w1iv: Vec = @splat(w1i);
+                const w2rv: Vec = @splat(w2r);
+                const w2iv: Vec = @splat(w2i);
+                const w3rv: Vec = @splat(w3r);
+                const w3iv: Vec = @splat(w3i);
+                while (q + lanes <= stride) : (q += lanes) {
+                    const ri0 = q + stride * (4 * p + 0);
+                    const ri1 = q + stride * (4 * p + 1);
+                    const ri2 = q + stride * (4 * p + 2);
+                    const ri3 = q + stride * (4 * p + 3);
+                    const wo0 = q + stride * (p + 0 * nq);
+                    const wo1 = q + stride * (p + 1 * nq);
+                    const wo2 = q + stride * (p + 2 * nq);
+                    const wo3 = q + stride * (p + 3 * nq);
 
-                    re[idx0] = t0r + w1.re + w2.re + w3.re;
-                    im[idx0] = t0i + w1.im + w2.im + w3.im;
-                    re[idx1] = t0r + w1.im - w2.re - w3.im;
-                    im[idx1] = t0i - w1.re - w2.im + w3.re;
-                    re[idx2] = t0r - w1.re + w2.re - w3.re;
-                    im[idx2] = t0i - w1.im + w2.im - w3.im;
-                    re[idx3] = t0r - w1.im - w2.re + w3.im;
-                    im[idx3] = t0i + w1.re - w2.im - w3.re;
-                }
-            } else {
-                while (k < q) : (k += 1) {
-                    const idx0 = start + k;
-                    const idx1 = idx0 + q;
-                    const idx2 = idx0 + 2 * q;
-                    const idx3 = idx0 + 3 * q;
+                    const ar: Vec = in_re[ri0..][0..lanes].*;
+                    const ai: Vec = in_im[ri0..][0..lanes].*;
+                    const br: Vec = in_re[ri1..][0..lanes].*;
+                    const bi: Vec = in_im[ri1..][0..lanes].*;
+                    const cr: Vec = in_re[ri2..][0..lanes].*;
+                    const ci: Vec = in_im[ri2..][0..lanes].*;
+                    const dr: Vec = in_re[ri3..][0..lanes].*;
+                    const di: Vec = in_im[ri3..][0..lanes].*;
 
-                    const t0r = re[idx0];
-                    const t0i = im[idx0];
-                    const w1 = cmul(re[idx1], im[idx1], wr[k * stride], wi[k * stride]);
-                    const w2 = cmul(re[idx2], im[idx2], wr[2 * k * stride], wi[2 * k * stride]);
-                    const w3 = cmul(re[idx3], im[idx3], wr[3 * k * stride], wi[3 * k * stride]);
+                    const t1 = cmulV(br, bi, w1rv, w1iv);
+                    const t2 = cmulV(cr, ci, w2rv, w2iv);
+                    const t3 = cmulV(dr, di, w3rv, w3iv);
 
-                    re[idx0] = t0r + w1.re + w2.re + w3.re;
-                    im[idx0] = t0i + w1.im + w2.im + w3.im;
-                    re[idx1] = t0r + w1.im - w2.re - w3.im;
-                    im[idx1] = t0i - w1.re - w2.im + w3.re;
-                    re[idx2] = t0r - w1.re + w2.re - w3.re;
-                    im[idx2] = t0i - w1.im + w2.im - w3.im;
-                    re[idx3] = t0r - w1.im - w2.re + w3.im;
-                    im[idx3] = t0i + w1.re - w2.im - w3.re;
+                    out_re[wo0..][0..lanes].* = ar + t1.re + t2.re + t3.re;
+                    out_im[wo0..][0..lanes].* = ai + t1.im + t2.im + t3.im;
+                    out_re[wo1..][0..lanes].* = ar + t1.im - t2.re - t3.im;
+                    out_im[wo1..][0..lanes].* = ai - t1.re - t2.im + t3.re;
+                    out_re[wo2..][0..lanes].* = ar - t1.re + t2.re - t3.re;
+                    out_im[wo2..][0..lanes].* = ai - t1.im + t2.im - t3.im;
+                    out_re[wo3..][0..lanes].* = ar - t1.im - t2.re + t3.im;
+                    out_im[wo3..][0..lanes].* = ai + t1.re - t2.im - t3.re;
                 }
             }
+            while (q < stride) : (q += 1) {
+                const ri0 = q + stride * (4 * p + 0);
+                const ri1 = q + stride * (4 * p + 1);
+                const ri2 = q + stride * (4 * p + 2);
+                const ri3 = q + stride * (4 * p + 3);
+                const wo0 = q + stride * (p + 0 * nq);
+                const wo1 = q + stride * (p + 1 * nq);
+                const wo2 = q + stride * (p + 2 * nq);
+                const wo3 = q + stride * (p + 3 * nq);
+
+                const ar = in_re[ri0];
+                const ai = in_im[ri0];
+                const t1 = cmul(in_re[ri1], in_im[ri1], w1r, w1i);
+                const t2 = cmul(in_re[ri2], in_im[ri2], w2r, w2i);
+                const t3 = cmul(in_re[ri3], in_im[ri3], w3r, w3i);
+
+                out_re[wo0] = ar + t1.re + t2.re + t3.re;
+                out_im[wo0] = ai + t1.im + t2.im + t3.im;
+                out_re[wo1] = ar + t1.im - t2.re - t3.im;
+                out_im[wo1] = ai - t1.re - t2.im + t3.re;
+                out_re[wo2] = ar - t1.re + t2.re - t3.re;
+                out_im[wo2] = ai - t1.im + t2.im - t3.im;
+                out_re[wo3] = ar - t1.im - t2.re + t3.im;
+                out_im[wo3] = ai + t1.re - t2.im - t3.re;
+            }
         }
+
+        const tr = in_re;
+        const ti = in_im;
+        in_re = out_re;
+        in_im = out_im;
+        out_re = tr;
+        out_im = ti;
+    }
+
+    if (in_re.ptr != re.ptr) {
+        @memcpy(re, in_re);
+        @memcpy(im, in_im);
     }
 }
 
@@ -206,7 +198,7 @@ test "hannWindow endpoints" {
     try std.testing.expect(@abs(w[512] - 1.0) < 1e-6);
 }
 
-test "fft scalar matches dft" {
+test "stockham matches dft" {
     const sizes = [_]usize{ 4, 16, 64 };
     for (sizes) |n| {
         const allocator = std.testing.allocator;
@@ -231,14 +223,13 @@ test "fft scalar matches dft" {
         fillInput(re, im);
         @memcpy(d_re, re);
         @memcpy(d_im, im);
-
-        fft(re, im, wr, wi, .scalar);
+        fft(re, im, scratch_re, scratch_im, wr, wi, .scalar);
         dft(d_re, d_im, scratch_re, scratch_im);
         try std.testing.expect(maxAbsDiff(re, im, d_re, d_im) < 1e-3);
     }
 }
 
-test "fft simd matches scalar" {
+test "stockham simd matches scalar" {
     const sizes = [_]usize{ 4, 16, 64, 256, 1024 };
     for (sizes) |n| {
         const allocator = std.testing.allocator;
@@ -250,6 +241,10 @@ test "fft simd matches scalar" {
         defer allocator.free(v_re);
         const v_im = try allocator.alloc(f32, n);
         defer allocator.free(v_im);
+        const scratch_re = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_re);
+        const scratch_im = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_im);
         const wr = try allocator.alloc(f32, n);
         defer allocator.free(wr);
         const wi = try allocator.alloc(f32, n);
@@ -259,9 +254,8 @@ test "fft simd matches scalar" {
         fillInput(s_re, s_im);
         @memcpy(v_re, s_re);
         @memcpy(v_im, s_im);
-
-        fft(s_re, s_im, wr, wi, .scalar);
-        fft(v_re, v_im, wr, wi, .simd);
+        fft(s_re, s_im, scratch_re, scratch_im, wr, wi, .scalar);
+        fft(v_re, v_im, scratch_re, scratch_im, wr, wi, .simd);
         try std.testing.expect(maxAbsDiff(s_re, s_im, v_re, v_im) < 1e-5);
     }
 }
