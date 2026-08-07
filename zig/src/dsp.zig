@@ -409,6 +409,57 @@ fn fft(
     }
 }
 
+/// Inverse via conjugate → forward FFT → conjugate + 1/N (spec §4.3).
+/// Reuses the same forward twiddles `wr`/`wi`.
+fn ifft(
+    re: []f32,
+    im: []f32,
+    scratch_re: []f32,
+    scratch_im: []f32,
+    wr: []const f32,
+    wi: []const f32,
+    backend: Backend,
+) void {
+    const n = re.len;
+    if (n == 0) return;
+
+    if (backend == .simd) {
+        const neg: Vec = @splat(-1);
+        var i: usize = 0;
+        while (i + lanes <= n) : (i += lanes) {
+            const v: Vec = im[i..][0..lanes].*;
+            im[i..][0..lanes].* = v * neg;
+        }
+        while (i < n) : (i += 1) im[i] = -im[i];
+    } else {
+        for (im) |*y| y.* = -y.*;
+    }
+
+    fft(re, im, scratch_re, scratch_im, wr, wi, backend);
+
+    const scale: f32 = 1.0 / @as(f32, @floatFromInt(n));
+    if (backend == .simd) {
+        const scale_v: Vec = @splat(scale);
+        const neg_scale: Vec = @splat(-scale);
+        var i: usize = 0;
+        while (i + lanes <= n) : (i += lanes) {
+            const rv: Vec = re[i..][0..lanes].*;
+            const iv: Vec = im[i..][0..lanes].*;
+            re[i..][0..lanes].* = rv * scale_v;
+            im[i..][0..lanes].* = iv * neg_scale;
+        }
+        while (i < n) : (i += 1) {
+            re[i] *= scale;
+            im[i] = -im[i] * scale;
+        }
+    } else {
+        for (re, im) |*r, *imag| {
+            r.* *= scale;
+            imag.* = -imag.* * scale;
+        }
+    }
+}
+
 /// Complete frames only (spec §4.6): start at 0, drop a trailing partial frame.
 fn stftFrameCount(audio_len: usize, window_size: usize, hop_size: usize) usize {
     if (audio_len < window_size or hop_size == 0) return 0;
@@ -587,6 +638,81 @@ test "fft simd matches scalar" {
         fft(v_re, v_im, scratch_re, scratch_im, wr, wi, .simd);
         try std.testing.expect(maxAbsDiff(s_re, s_im, v_re, v_im) < 1e-5);
 
+    }
+}
+
+test "ifft round-trips fft" {
+    const sizes = [_]usize{ 4, 16, 64, 256 };
+    for (sizes) |n| {
+        const allocator = std.testing.allocator;
+        const re = try allocator.alloc(f32, n);
+        defer allocator.free(re);
+        const im = try allocator.alloc(f32, n);
+        defer allocator.free(im);
+        const orig_re = try allocator.alloc(f32, n);
+        defer allocator.free(orig_re);
+        const orig_im = try allocator.alloc(f32, n);
+        defer allocator.free(orig_im);
+        const scratch_re = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_re);
+        const scratch_im = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_im);
+        const wr = try allocator.alloc(f32, n);
+        defer allocator.free(wr);
+        const wi = try allocator.alloc(f32, n);
+        defer allocator.free(wi);
+
+        fillTwiddles(wr, wi);
+        fillInput(re, im);
+        // Complex input so conjugate path is exercised.
+        for (im, 0..) |*y, idx| {
+            y.* = @cos(0.4 * @as(f32, @floatFromInt(idx)));
+        }
+        @memcpy(orig_re, re);
+        @memcpy(orig_im, im);
+
+        fft(re, im, scratch_re, scratch_im, wr, wi, .scalar);
+        ifft(re, im, scratch_re, scratch_im, wr, wi, .scalar);
+        try std.testing.expect(maxAbsDiff(re, im, orig_re, orig_im) < 1e-4);
+    }
+}
+
+test "ifft simd matches scalar" {
+    const sizes = [_]usize{ 4, 16, 64, 256, 1024 };
+    for (sizes) |n| {
+        const allocator = std.testing.allocator;
+        const s_re = try allocator.alloc(f32, n);
+        defer allocator.free(s_re);
+        const s_im = try allocator.alloc(f32, n);
+        defer allocator.free(s_im);
+        const v_re = try allocator.alloc(f32, n);
+        defer allocator.free(v_re);
+        const v_im = try allocator.alloc(f32, n);
+        defer allocator.free(v_im);
+        const scratch_re = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_re);
+        const scratch_im = try allocator.alloc(f32, n);
+        defer allocator.free(scratch_im);
+        const wr = try allocator.alloc(f32, n);
+        defer allocator.free(wr);
+        const wi = try allocator.alloc(f32, n);
+        defer allocator.free(wi);
+
+        fillTwiddles(wr, wi);
+        fillInput(s_re, s_im);
+        for (s_im, 0..) |*y, idx| {
+            y.* = @cos(0.4 * @as(f32, @floatFromInt(idx)));
+        }
+        @memcpy(v_re, s_re);
+        @memcpy(v_im, s_im);
+
+        // Same spectrum into both backends, then inverse.
+        fft(s_re, s_im, scratch_re, scratch_im, wr, wi, .scalar);
+        @memcpy(v_re, s_re);
+        @memcpy(v_im, s_im);
+        ifft(s_re, s_im, scratch_re, scratch_im, wr, wi, .scalar);
+        ifft(v_re, v_im, scratch_re, scratch_im, wr, wi, .simd);
+        try std.testing.expect(maxAbsDiff(s_re, s_im, v_re, v_im) < 1e-5);
     }
 }
 
