@@ -551,6 +551,103 @@ pub fn stft(
     return .{ .re = re, .im = im, .frames = frames, .n = n };
 }
 
+/// Inverse STFT: IFFT each frame, synthesis-window, overlap-add, divide by Σw²
+/// (spec §4.5). Spectra are not modified. Output length is the span of complete
+/// frames: `(frames - 1) * hop + N` (0 if no frames).
+pub fn istft(
+    allocator: std.mem.Allocator,
+    spectra: StftSpectra,
+    hop_size: usize,
+    backend: Backend,
+) ![]f32 {
+    const n = spectra.n;
+    const frames = spectra.frames;
+    if (hop_size == 0) return error.InvalidHopSize;
+    if (frames == 0) return try allocator.alloc(f32, 0);
+
+    const out_len = (frames - 1) * hop_size + n;
+    const y = try allocator.alloc(f32, out_len);
+    errdefer allocator.free(y);
+    const weight = try allocator.alloc(f32, out_len);
+    defer allocator.free(weight);
+    @memset(y, 0);
+    @memset(weight, 0);
+
+    const window = try allocator.alloc(f32, n);
+    defer allocator.free(window);
+    const wr = try allocator.alloc(f32, n);
+    defer allocator.free(wr);
+    const wi = try allocator.alloc(f32, n);
+    defer allocator.free(wi);
+    const buf_re = try allocator.alloc(f32, n);
+    defer allocator.free(buf_re);
+    const buf_im = try allocator.alloc(f32, n);
+    defer allocator.free(buf_im);
+    const scratch_re = try allocator.alloc(f32, n);
+    defer allocator.free(scratch_re);
+    const scratch_im = try allocator.alloc(f32, n);
+    defer allocator.free(scratch_im);
+
+    hannWindow(window);
+    fillTwiddles(wr, wi);
+
+    var frame: usize = 0;
+    while (frame < frames) : (frame += 1) {
+        const src_re = spectra.re[frame * n ..][0..n];
+        const src_im = spectra.im[frame * n ..][0..n];
+        @memcpy(buf_re, src_re);
+        @memcpy(buf_im, src_im);
+        ifft(buf_re, buf_im, scratch_re, scratch_im, wr, wi, backend);
+
+        const start = frame * hop_size;
+        if (backend == .simd) {
+            var i: usize = 0;
+            while (i + lanes <= n) : (i += lanes) {
+                const x: Vec = buf_re[i..][0..lanes].*;
+                const w: Vec = window[i..][0..lanes].*;
+                const yv: Vec = y[start + i ..][0..lanes].*;
+                const cv: Vec = weight[start + i ..][0..lanes].*;
+                y[start + i ..][0..lanes].* = yv + x * w;
+                weight[start + i ..][0..lanes].* = cv + w * w;
+            }
+            while (i < n) : (i += 1) {
+                const w = window[i];
+                y[start + i] += buf_re[i] * w;
+                weight[start + i] += w * w;
+            }
+        } else {
+            for (0..n) |i| {
+                const w = window[i];
+                y[start + i] += buf_re[i] * w;
+                weight[start + i] += w * w;
+            }
+        }
+    }
+
+    const eps: f32 = 1e-12;
+    if (backend == .simd) {
+        const eps_v: Vec = @splat(eps);
+        const zero: Vec = @splat(0);
+        var i: usize = 0;
+        while (i + lanes <= out_len) : (i += lanes) {
+            const yv: Vec = y[i..][0..lanes].*;
+            const cv: Vec = weight[i..][0..lanes].*;
+            const safe = cv > eps_v;
+            const inv = @select(f32, safe, @as(Vec, @splat(1)) / cv, zero);
+            y[i..][0..lanes].* = yv * inv;
+        }
+        while (i < out_len) : (i += 1) {
+            if (weight[i] > eps) y[i] /= weight[i];
+        }
+    } else {
+        for (y, weight) |*yy, c| {
+            if (c > eps) yy.* /= c;
+        }
+    }
+
+    return y;
+}
+
 /// Absolute physical frequency of bin `k` (spec §4.4): mirrors above Nyquist.
 fn binAbsFreq(k: usize, n: usize, sample_rate: f32) f32 {
     const mirrored = @min(k, n - k);
@@ -914,4 +1011,51 @@ test "stft simd matches scalar" {
 
     try std.testing.expectEqual(a.frames, b.frames);
     try std.testing.expect(maxAbsDiff(a.re, a.im, b.re, b.im) < 1e-4);
+}
+
+test "istft reconstructs stft (unity gain)" {
+    const allocator = std.testing.allocator;
+    const n: usize = 256;
+    const hop: usize = 64;
+    // Length so complete frames cover the whole buffer: (L-N) % H == 0.
+    const audio = try allocator.alloc(f32, 1024);
+    defer allocator.free(audio);
+    for (audio, 0..) |*x, i| {
+        x.* = @sin(0.11 * @as(f32, @floatFromInt(i))) + 0.3 * @cos(0.03 * @as(f32, @floatFromInt(i)));
+    }
+
+    var spec = try stft(allocator, audio, n, hop, .scalar);
+    defer spec.deinit(allocator);
+    const out = try istft(allocator, spec, hop, .scalar);
+    defer allocator.free(out);
+
+    try std.testing.expectEqual(audio.len, out.len);
+    // Periodic Hann has w[0]=0, so Σw² at sample 0 is 0 → zero-filled (spec §4.6).
+    try std.testing.expectEqual(@as(f32, 0), out[0]);
+    var max_err: f32 = 0;
+    for (audio[1..], out[1..]) |a, b| max_err = @max(max_err, @abs(a - b));
+    try std.testing.expect(max_err < 2e-4);
+}
+
+test "istft simd matches scalar" {
+    const allocator = std.testing.allocator;
+    const n: usize = 256;
+    const hop: usize = 64;
+    const audio = try allocator.alloc(f32, 1024);
+    defer allocator.free(audio);
+    for (audio, 0..) |*x, i| {
+        x.* = @sin(0.11 * @as(f32, @floatFromInt(i)));
+    }
+
+    var spec = try stft(allocator, audio, n, hop, .scalar);
+    defer spec.deinit(allocator);
+    const a = try istft(allocator, spec, hop, .scalar);
+    defer allocator.free(a);
+    const b = try istft(allocator, spec, hop, .simd);
+    defer allocator.free(b);
+
+    try std.testing.expectEqual(a.len, b.len);
+    var max_err: f32 = 0;
+    for (a, b) |x, y| max_err = @max(max_err, @abs(x - y));
+    try std.testing.expect(max_err < 1e-4);
 }
