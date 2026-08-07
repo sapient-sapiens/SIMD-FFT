@@ -551,6 +551,87 @@ pub fn stft(
     return .{ .re = re, .im = im, .frames = frames, .n = n };
 }
 
+/// Absolute physical frequency of bin `k` (spec §4.4): mirrors above Nyquist.
+fn binAbsFreq(k: usize, n: usize, sample_rate: f32) f32 {
+    const mirrored = @min(k, n - k);
+    return @as(f32, @floatFromInt(mirrored)) * sample_rate / @as(f32, @floatFromInt(n));
+}
+
+/// Brick-wall low-pass: G[k] = 1 if |f_k| ≤ cutoff, else 0.
+pub fn fillLowpass(gain: []f32, sample_rate: f32, cutoff: f32) void {
+    const n = gain.len;
+    for (gain, 0..) |*g, k| {
+        g.* = if (binAbsFreq(k, n, sample_rate) <= cutoff) 1 else 0;
+    }
+}
+
+/// Brick-wall high-pass: G[k] = 1 if |f_k| ≥ cutoff, else 0.
+pub fn fillHighpass(gain: []f32, sample_rate: f32, cutoff: f32) void {
+    const n = gain.len;
+    for (gain, 0..) |*g, k| {
+        g.* = if (binAbsFreq(k, n, sample_rate) >= cutoff) 1 else 0;
+    }
+}
+
+/// Notch: G[k] = 0 if ||f_k| − f0| < width, else 1.
+pub fn fillNotch(gain: []f32, sample_rate: f32, frequency: f32, width: f32) void {
+    const n = gain.len;
+    for (gain, 0..) |*g, k| {
+        const f = binAbsFreq(k, n, sample_rate);
+        g.* = if (@abs(f - frequency) < width) 0 else 1;
+    }
+}
+
+/// Three-band EQ (spec §5): 20–250 / 250–2000 / 2000–Nyquist. Gains are linear.
+pub fn fillEq(gain: []f32, sample_rate: f32, bass: f32, mid: f32, treble: f32) void {
+    const n = gain.len;
+    for (gain, 0..) |*g, k| {
+        const f = binAbsFreq(k, n, sample_rate);
+        if (f < 250) {
+            g.* = bass;
+        } else if (f < 2000) {
+            g.* = mid;
+        } else {
+            g.* = treble;
+        }
+    }
+}
+
+/// Pointwise Y[k] = G[k] X[k]. `re`/`im` are one frame or time-major frames×N;
+/// `gain` is length N and repeats across frames. Real G preserves conjugate
+/// symmetry when G[k] = G[N−k].
+pub fn applyGain(re: []f32, im: []f32, gain: []const f32, backend: Backend) void {
+    const n = gain.len;
+    std.debug.assert(n > 0 and re.len == im.len and re.len % n == 0);
+    const frames = re.len / n;
+
+    var frame: usize = 0;
+    while (frame < frames) : (frame += 1) {
+        const base = frame * n;
+        const fr = re[base..][0..n];
+        const fi = im[base..][0..n];
+        if (backend == .simd) {
+            var i: usize = 0;
+            while (i + lanes <= n) : (i += lanes) {
+                const g: Vec = gain[i..][0..lanes].*;
+                const rv: Vec = fr[i..][0..lanes].*;
+                const iv: Vec = fi[i..][0..lanes].*;
+                fr[i..][0..lanes].* = rv * g;
+                fi[i..][0..lanes].* = iv * g;
+            }
+            while (i < n) : (i += 1) {
+                fr[i] *= gain[i];
+                fi[i] *= gain[i];
+            }
+        } else {
+            for (fr, fi, gain) |*r, *imag, g| {
+                r.* *= g;
+                imag.* *= g;
+            }
+        }
+    }
+}
+
 // Testing stuff from here on out
 
 fn fillInput(re: []f32, im: []f32) void {
@@ -714,6 +795,68 @@ test "ifft simd matches scalar" {
         ifft(v_re, v_im, scratch_re, scratch_im, wr, wi, .simd);
         try std.testing.expect(maxAbsDiff(s_re, s_im, v_re, v_im) < 1e-5);
     }
+}
+
+test "gain tables respect conjugate symmetry" {
+    var g: [64]f32 = undefined;
+    fillLowpass(&g, 48000, 3000);
+    for (1..32) |k| {
+        try std.testing.expectEqual(g[k], g[64 - k]);
+    }
+    fillHighpass(&g, 48000, 3000);
+    for (1..32) |k| {
+        try std.testing.expectEqual(g[k], g[64 - k]);
+    }
+    fillNotch(&g, 48000, 60, 5);
+    for (1..32) |k| {
+        try std.testing.expectEqual(g[k], g[64 - k]);
+    }
+}
+
+test "lowpass keeps DC drops Nyquist" {
+    var g: [64]f32 = undefined;
+    // Δf = 48000/64 = 750 Hz; cutoff 1000 → bins 0 and mirror keep, Nyquist (24 kHz) drops.
+    fillLowpass(&g, 48000, 1000);
+    try std.testing.expectEqual(@as(f32, 1), g[0]);
+    try std.testing.expectEqual(@as(f32, 1), g[1]);
+    try std.testing.expectEqual(@as(f32, 0), g[2]);
+    try std.testing.expectEqual(@as(f32, 0), g[32]);
+}
+
+test "applyGain simd matches scalar" {
+    const allocator = std.testing.allocator;
+    const n: usize = 256;
+    const frames: usize = 3;
+    const re_s = try allocator.alloc(f32, n * frames);
+    defer allocator.free(re_s);
+    const im_s = try allocator.alloc(f32, n * frames);
+    defer allocator.free(im_s);
+    const re_v = try allocator.alloc(f32, n * frames);
+    defer allocator.free(re_v);
+    const im_v = try allocator.alloc(f32, n * frames);
+    defer allocator.free(im_v);
+    var gain: [256]f32 = undefined;
+    fillEq(&gain, 48000, 0.5, 1.0, 0.25);
+
+    for (re_s, im_s, 0..) |*r, *i, idx| {
+        r.* = @sin(0.13 * @as(f32, @floatFromInt(idx)));
+        i.* = @cos(0.07 * @as(f32, @floatFromInt(idx)));
+    }
+    @memcpy(re_v, re_s);
+    @memcpy(im_v, im_s);
+
+    applyGain(re_s, im_s, &gain, .scalar);
+    applyGain(re_v, im_v, &gain, .simd);
+    try std.testing.expect(maxAbsDiff(re_s, im_s, re_v, im_v) < 1e-6);
+}
+
+test "applyGain unity is identity" {
+    var re = [_]f32{ 1, 2, 3, 4 };
+    var im = [_]f32{ 5, 6, 7, 8 };
+    const gain = [_]f32{ 1, 1, 1, 1 };
+    applyGain(&re, &im, &gain, .scalar);
+    try std.testing.expectEqual(@as(f32, 1), re[0]);
+    try std.testing.expectEqual(@as(f32, 8), im[3]);
 }
 
 test "stft frame count drops partial" {
