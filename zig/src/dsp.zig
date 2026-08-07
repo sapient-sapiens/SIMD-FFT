@@ -409,6 +409,99 @@ fn fft(
     }
 }
 
+/// Complete frames only (spec §4.6): start at 0, drop a trailing partial frame.
+fn stftFrameCount(audio_len: usize, window_size: usize, hop_size: usize) usize {
+    if (audio_len < window_size or hop_size == 0) return 0;
+    return (audio_len - window_size) / hop_size + 1;
+}
+
+/// Time-major complex spectra: frame `t` lives in `re/im[t*n .. (t+1)*n]`.
+pub const StftSpectra = struct {
+    re: []f32,
+    im: []f32,
+    frames: usize,
+    n: usize,
+
+    pub fn deinit(self: *StftSpectra, allocator: std.mem.Allocator) void {
+        allocator.free(self.re);
+        allocator.free(self.im);
+        self.* = undefined;
+    }
+};
+
+/// STFT analysis. Audio is never written — overlapping hops would otherwise corrupt
+/// each other under in-place FFT. Per frame we window-multiply into that frame's
+/// output slot (O(N)), then FFT there with a reused scratch (O(N log N)). The
+/// copy is not the bottleneck; skipping a second spectrum memcpy is the win.
+pub fn stft(
+    allocator: std.mem.Allocator,
+    audio: []const f32,
+    window_size: usize,
+    hop_size: usize,
+    backend: Backend,
+) !StftSpectra {
+    const n = window_size;
+    if (n == 0 or (n & (n - 1)) != 0) return error.WindowSizeNotPowerOfTwo;
+    // Radix-4 Stockham: N must be 4^k (4, 16, 64, 256, 1024, …).
+    var t = n;
+    while (t > 1) : (t /= 4) {
+        if (t % 4 != 0) return error.WindowSizeNotPowerOfFour;
+    }
+
+    const frames = stftFrameCount(audio.len, n, hop_size);
+    const total = frames * n;
+
+    const re = try allocator.alloc(f32, total);
+    errdefer allocator.free(re);
+    const im = try allocator.alloc(f32, total);
+    errdefer allocator.free(im);
+
+    const window = try allocator.alloc(f32, n);
+    defer allocator.free(window);
+    const wr = try allocator.alloc(f32, n);
+    defer allocator.free(wr);
+    const wi = try allocator.alloc(f32, n);
+    defer allocator.free(wi);
+    const scratch_re = try allocator.alloc(f32, n);
+    defer allocator.free(scratch_re);
+    const scratch_im = try allocator.alloc(f32, n);
+    defer allocator.free(scratch_im);
+
+    hannWindow(window);
+    fillTwiddles(wr, wi);
+
+    var frame: usize = 0;
+    while (frame < frames) : (frame += 1) {
+        const start = frame * hop_size;
+        const out_re = re[frame * n ..][0..n];
+        const out_im = im[frame * n ..][0..n];
+
+        // Fused gather + analysis window into the spectrum slot (audio untouched).
+        if (backend == .simd) {
+            var i: usize = 0;
+            while (i + lanes <= n) : (i += lanes) {
+                const x: Vec = audio[start + i ..][0..lanes].*;
+                const w: Vec = window[i..][0..lanes].*;
+                out_re[i..][0..lanes].* = x * w;
+            }
+            while (i < n) : (i += 1) {
+                out_re[i] = audio[start + i] * window[i];
+            }
+        } else {
+            for (out_re, audio[start .. start + n], window) |*y, x, w| {
+                y.* = x * w;
+            }
+        }
+        @memset(out_im, 0);
+
+        fft(out_re, out_im, scratch_re, scratch_im, wr, wi, backend);
+    }
+
+    return .{ .re = re, .im = im, .frames = frames, .n = n };
+}
+
+// Testing stuff from here on out
+
 fn fillInput(re: []f32, im: []f32) void {
     for (re, im, 0..) |*r, *i, idx| {
         r.* = @sin(0.7 * @as(f32, @floatFromInt(idx)) + 0.3);
@@ -424,6 +517,8 @@ fn maxAbsDiff(a_re: []const f32, a_im: []const f32, b_re: []const f32, b_im: []c
     }
     return m;
 }
+
+
 
 test "hannWindow endpoints" {
     var w: [1024]f32 = undefined;
@@ -491,5 +586,63 @@ test "fft simd matches scalar" {
         fft(s_re, s_im, scratch_re, scratch_im, wr, wi, .scalar);
         fft(v_re, v_im, scratch_re, scratch_im, wr, wi, .simd);
         try std.testing.expect(maxAbsDiff(s_re, s_im, v_re, v_im) < 1e-5);
+
     }
+}
+
+test "stft frame count drops partial" {
+    // N=16, H=4, len=40 → starts 0,4,8,12,16,20,24; 28+16=44>40 → 7 frames.
+    try std.testing.expectEqual(@as(usize, 7), stftFrameCount(40, 16, 4));
+    try std.testing.expectEqual(@as(usize, 0), stftFrameCount(15, 16, 4));
+    try std.testing.expectEqual(@as(usize, 1), stftFrameCount(16, 16, 4));
+}
+
+test "stft exact-bin cosine peaks at k" {
+    const allocator = std.testing.allocator;
+    const n: usize = 64;
+    const hop: usize = 16;
+    const k0: usize = 5;
+    const audio = try allocator.alloc(f32, n + 3 * hop);
+    defer allocator.free(audio);
+    const n_f: f32 = @floatFromInt(n);
+    for (audio, 0..) |*x, i| {
+        x.* = @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(k0)) * @as(f32, @floatFromInt(i)) / n_f);
+    }
+
+    var spec = try stft(allocator, audio, n, hop, .scalar);
+    defer spec.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 4), spec.frames);
+
+    // First frame: peak power at ±k0 (Hann spreads a little; argmax still k0).
+    var best_k: usize = 0;
+    var best_p: f32 = -1;
+    for (0..n) |k| {
+        const r = spec.re[k];
+        const im = spec.im[k];
+        const p = r * r + im * im;
+        if (p > best_p) {
+            best_p = p;
+            best_k = k;
+        }
+    }
+    try std.testing.expect(best_k == k0 or best_k == n - k0);
+}
+
+test "stft simd matches scalar" {
+    const allocator = std.testing.allocator;
+    const n: usize = 256;
+    const hop: usize = 64;
+    const audio = try allocator.alloc(f32, 1024);
+    defer allocator.free(audio);
+    for (audio, 0..) |*x, i| {
+        x.* = @sin(0.11 * @as(f32, @floatFromInt(i)));
+    }
+
+    var a = try stft(allocator, audio, n, hop, .scalar);
+    defer a.deinit(allocator);
+    var b = try stft(allocator, audio, n, hop, .simd);
+    defer b.deinit(allocator);
+
+    try std.testing.expectEqual(a.frames, b.frames);
+    try std.testing.expect(maxAbsDiff(a.re, a.im, b.re, b.im) < 1e-4);
 }
